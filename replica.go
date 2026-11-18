@@ -167,12 +167,16 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	}
 	defer r.syncSem.Release(1)
 
-	// Clear last position if if an error occurs during sync.
+	// Clear last position if an error occurs during sync. The cached L1 max
+	// is only valid while that position is known, so drop it too.
 	defer func() {
 		if err != nil {
 			r.mu.Lock()
 			r.pos = ltx.Pos{}
 			r.mu.Unlock()
+			if r.db != nil {
+				r.db.invalidateMaxLTXFileInfo(1)
+			}
 		}
 	}()
 
@@ -307,10 +311,17 @@ func (r *Replica) Pos() ltx.Pos {
 }
 
 // SetPos sets the current replicated position.
+// A position that moves backward drops the cached L1 max. L0 retention uses
+// that cache as its coverage bound, and a lower replica position means the
+// cached file may now be ahead of the replica.
 func (r *Replica) SetPos(pos ltx.Pos) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	prev := r.pos.TXID
 	r.pos = pos
+	r.mu.Unlock()
+	if r.db != nil && prev > 0 && pos.TXID < prev {
+		r.db.invalidateMaxLTXFileInfo(1)
+	}
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.

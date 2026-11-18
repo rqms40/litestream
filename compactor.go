@@ -73,7 +73,7 @@ func (c *Compactor) setLogger(logger *slog.Logger) {
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
 	if c.CacheGetter != nil {
-		if info, ok := c.CacheGetter(level); ok {
+		if info, ok := c.CacheGetter(level); ok && info != nil {
 			return *info, nil
 		}
 	}
@@ -318,7 +318,12 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 	if !c.RetentionEnabled {
 		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+		// The delete may have removed the cached max file before returning
+		// the error. Drop it so L0 retention cannot treat it as coverage.
+		c.dropCachedLTXFileIfRemoved(level, deleted)
 		return fmt.Errorf("remove ltx files: %w", err)
+	} else {
+		c.dropCachedLTXFileIfRemoved(level, deleted)
 	}
 
 	if c.LocalFileDeleter != nil {
@@ -334,6 +339,29 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 	}
 
 	return nil
+}
+
+// dropCachedLTXFileIfRemoved forgets a cached max file that retention just
+// removed. L0 retention treats that cache as L1 coverage, so a deleted file
+// left in the cache would allow deletion of L0 files that are no longer
+// compacted into L1.
+func (c *Compactor) dropCachedLTXFileIfRemoved(level int, removed []*ltx.FileInfo) {
+	if c.CacheGetter == nil || c.CacheSetter == nil || len(removed) == 0 {
+		return
+	}
+	info, ok := c.CacheGetter(level)
+	if !ok || info == nil {
+		return
+	}
+	for _, file := range removed {
+		if file == nil {
+			continue
+		}
+		if file.MinTXID == info.MinTXID && file.MaxTXID == info.MaxTXID {
+			c.CacheSetter(level, nil)
+			return
+		}
+	}
 }
 
 // EnforceL0Retention retains L0 files based on L1 compaction progress and time.

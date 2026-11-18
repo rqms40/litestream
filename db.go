@@ -374,6 +374,12 @@ func NewDB(path string) *DB {
 	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
+		// A nil info drops the level. Retention uses this when the cached
+		// file has been removed and must not count as L1 coverage.
+		if info == nil {
+			delete(db.maxLTXFileInfos.m, level)
+			return
+		}
 		db.maxLTXFileInfos.m[level] = info
 	}
 
@@ -1709,6 +1715,10 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	db.Logger.Info("detected database behind replica",
 		"db_txid", dbPos.TXID,
 		"replica_txid", replicaInfo.MaxTXID)
+
+	// The database was restored out from under the replica. Cached L1
+	// coverage was learned for the previous position.
+	db.invalidateMaxLTXFileInfo(1)
 
 	// Clear local L0 files
 	l0Dir := db.LTXLevelDir(0)
@@ -3142,7 +3152,9 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 }
 
 // EnforceL0RetentionByTime retains L0 files until they have been compacted into
-// L1 and have existed for at least L0Retention.
+// L1 and have existed for at least L0Retention. The L1 bound comes from the
+// max-file cache compaction already maintains, so a check does not list every
+// L1 object.
 func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if db.L0Retention <= 0 {
 		return nil
@@ -3153,19 +3165,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	dbName := filepath.Base(db.Path())
 
 	// Determine the highest TXID that has been compacted into L1.
-	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	maxL1TXID, err := db.maxL1TXIDForRetention(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch l1 files: %w", err)
-	}
-	var maxL1TXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return fmt.Errorf("close l1 iterator: %w", err)
+		return err
 	}
 	if maxL1TXID == 0 {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
@@ -3175,7 +3177,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	}
 
 	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	itr, err := db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch l0 files: %w", err)
 	}
@@ -3265,6 +3267,31 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
 	return nil
+}
+
+// maxL1TXIDForRetention returns the highest TXID compacted into level 1.
+// Compaction records each L1 file it writes, and the first check after
+// process start or a discarded cache lists the level once and stores the
+// max. Later checks reuse that value. A cached TXID ahead of the replicated
+// position is discarded and the level is listed again, so L0 files that are
+// not actually covered by L1 are kept.
+func (db *DB) maxL1TXIDForRetention(ctx context.Context) (ltx.TXID, error) {
+	if info, ok := db.cachedMaxLTXFileInfo(1); ok && info.MaxTXID > 0 {
+		pos := db.Replica.Pos()
+		if pos.IsZero() || info.MaxTXID <= pos.TXID {
+			return info.MaxTXID, nil
+		}
+		db.Logger.Debug("discarding cached l1 max ahead of replica",
+			"cached_txid", info.MaxTXID,
+			"replica_txid", pos.TXID)
+		db.invalidateMaxLTXFileInfo(1)
+	}
+
+	info, err := db.compactor.MaxLTXFileInfo(ctx, 1)
+	if err != nil {
+		return 0, fmt.Errorf("fetch l1 files: %w", err)
+	}
+	return info.MaxTXID, nil
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below
@@ -3406,7 +3433,7 @@ func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, erro
 	defer db.maxLTXFileInfos.Unlock()
 
 	info, ok := db.maxLTXFileInfos.m[level]
-	if ok {
+	if ok && info != nil {
 		return *info, nil
 	}
 
@@ -3417,6 +3444,26 @@ func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, erro
 
 	db.maxLTXFileInfos.m[level] = &remoteInfo
 	return remoteInfo, nil
+}
+
+// cachedMaxLTXFileInfo returns a copy of the cached max file for level.
+func (db *DB) cachedMaxLTXFileInfo(level int) (ltx.FileInfo, bool) {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	info, ok := db.maxLTXFileInfos.m[level]
+	if !ok || info == nil {
+		return ltx.FileInfo{}, false
+	}
+	return *info, true
+}
+
+// invalidateMaxLTXFileInfo drops the cached max file for level so the next
+// reader lists the replica. Call this when the cached file may no longer
+// exist or may be ahead of the replica.
+func (db *DB) invalidateMaxLTXFileInfo(level int) {
+	db.maxLTXFileInfos.Lock()
+	delete(db.maxLTXFileInfos.m, level)
+	db.maxLTXFileInfos.Unlock()
 }
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.
