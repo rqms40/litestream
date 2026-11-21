@@ -49,8 +49,20 @@ type Compactor struct {
 	CacheGetter func(level int) (*ltx.FileInfo, bool)
 
 	// CacheSetter optionally stores MaxLTXFileInfo for a level.
-	// If nil, max file info is not cached.
+	// If nil, max file info is not cached. A nil info clears the level.
+	// Compaction uses this for the file it just wrote.
 	CacheSetter func(level int, info *ltx.FileInfo)
+
+	// CacheEpoch optionally returns a counter that changes when cached
+	// max-file info is invalidated. MaxLTXFileInfo snapshots it before listing.
+	CacheEpoch func() uint64
+
+	// PublishCachedMax optionally stores a max file discovered by listing.
+	// epoch is the CacheEpoch value from before the list. The callback must
+	// not replace a newer cached file and must not store after invalidation.
+	// It returns the file callers should use. When set, listings use this
+	// instead of CacheSetter.
+	PublishCachedMax func(level int, info *ltx.FileInfo, epoch uint64) *ltx.FileInfo
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -71,7 +83,13 @@ func (c *Compactor) setLogger(logger *slog.Logger) {
 
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
+// A listing that finishes after a newer file was cached, or after the cache
+// was invalidated, does not replace that newer state.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
+	var epoch uint64
+	if c.CacheEpoch != nil {
+		epoch = c.CacheEpoch()
+	}
 	if c.CacheGetter != nil {
 		if info, ok := c.CacheGetter(level); ok && info != nil {
 			return *info, nil
@@ -92,7 +110,11 @@ func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 		}
 	}
 
-	if c.CacheSetter != nil && info.MaxTXID > 0 {
+	if info.MaxTXID > 0 && c.PublishCachedMax != nil {
+		if published := c.PublishCachedMax(level, &info, epoch); published != nil {
+			info = *published
+		}
+	} else if c.CacheSetter != nil && info.MaxTXID > 0 {
 		c.CacheSetter(level, &info)
 	}
 

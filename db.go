@@ -81,10 +81,13 @@ type DB struct {
 
 	lastLTXPage *verifiedLTXPage
 
-	// last file info for each level
+	// last file info for each level.
+	// gen changes when the cache is cleared so an in-flight listing cannot
+	// refill it after reset or invalidation.
 	maxLTXFileInfos struct {
 		sync.Mutex
-		m map[int]*ltx.FileInfo
+		m   map[int]*ltx.FileInfo
+		gen uint64
 	}
 
 	// Cached position from the latest L0 LTX file.
@@ -371,13 +374,21 @@ func NewDB(path string) *DB {
 		info, ok := db.maxLTXFileInfos.m[level]
 		return info, ok
 	}
+	db.compactor.CacheEpoch = func() uint64 {
+		db.maxLTXFileInfos.Lock()
+		defer db.maxLTXFileInfos.Unlock()
+		return db.maxLTXFileInfos.gen
+	}
+	db.compactor.PublishCachedMax = db.publishCachedMaxLTX
 	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
 		// A nil info drops the level. Retention uses this when the cached
 		// file has been removed and must not count as L1 coverage.
+		// Bump the epoch so a listing already in flight cannot put it back.
 		if info == nil {
 			delete(db.maxLTXFileInfos.m, level)
+			db.maxLTXFileInfos.gen++
 			return
 		}
 		db.maxLTXFileInfos.m[level] = info
@@ -620,9 +631,11 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 		return fmt.Errorf("remove ltx directory: %w", err)
 	}
 
-	// Clear cached LTX file info
+	// Clear cached LTX file info. The epoch bump drops listings that started
+	// before the reset and finish after it.
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.gen++
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
@@ -3463,7 +3476,36 @@ func (db *DB) cachedMaxLTXFileInfo(level int) (ltx.FileInfo, bool) {
 func (db *DB) invalidateMaxLTXFileInfo(level int) {
 	db.maxLTXFileInfos.Lock()
 	delete(db.maxLTXFileInfos.m, level)
+	db.maxLTXFileInfos.gen++
 	db.maxLTXFileInfos.Unlock()
+}
+
+// publishCachedMaxLTX stores a max file observed by a listing that started at
+// epoch. It does not replace a newer cached TXID, and it does not store
+// anything if the cache was invalidated after the listing started. The
+// returned info is the value callers should use.
+func (db *DB) publishCachedMaxLTX(level int, info *ltx.FileInfo, epoch uint64) *ltx.FileInfo {
+	if info == nil || info.MaxTXID == 0 {
+		return nil
+	}
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+
+	cur := db.maxLTXFileInfos.m[level]
+	if epoch != db.maxLTXFileInfos.gen {
+		if cur == nil {
+			return nil
+		}
+		cp := *cur
+		return &cp
+	}
+	if cur != nil && cur.MaxTXID >= info.MaxTXID {
+		cp := *cur
+		return &cp
+	}
+	cp := *info
+	db.maxLTXFileInfos.m[level] = &cp
+	return &cp
 }
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.

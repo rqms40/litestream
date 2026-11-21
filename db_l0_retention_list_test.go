@@ -379,3 +379,115 @@ func TestDB_EnforceL0RetentionByTime_RelistsAfterReset(t *testing.T) {
 		t.Fatal("deleted L0 file that is not compacted into L1")
 	}
 }
+
+// gateLTXClient blocks the first listing of one level so a test can update
+// the max-file cache while that listing is in flight.
+type gateLTXClient struct {
+	*countingLTXClient
+	level   int
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (c *gateLTXClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	if level == c.level {
+		c.once.Do(func() { close(c.started) })
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.release:
+		}
+	}
+	return c.countingLTXClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+// TestDB_MaxLTXFileInfo_DelayedListKeepsCompactionTXID is the regression test
+// for a cache fill that finishes after compaction. The listing observes TXID
+// 100, compaction records 200 while the listing is blocked, and the fill must
+// not replace 200. The next compaction seeks from the cached max.
+func TestDB_MaxLTXFileInfo_DelayedListKeepsCompactionTXID(t *testing.T) {
+	inner := newCountingLTXClient()
+	inner.add(agedLTX(1, 1, 100))
+	release := make(chan struct{})
+	client := &gateLTXClient{
+		countingLTXClient: inner,
+		level:             1,
+		started:           make(chan struct{}),
+		release:           release,
+	}
+	db := openRetentionDB(t, client)
+
+	type result struct {
+		info ltx.FileInfo
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		info, err := db.compactor.MaxLTXFileInfo(context.Background(), 1)
+		done <- result{info: info, err: err}
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("level 1 listing did not start")
+	}
+
+	// Compaction records the L1 file it just wrote.
+	db.compactor.CacheSetter(1, agedLTX(1, 1, 200))
+	close(release)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatal(got.err)
+	}
+	cached, ok := db.cachedMaxLTXFileInfo(1)
+	if !ok {
+		t.Fatal("cache empty after listing")
+	}
+	if cached.MaxTXID != 200 {
+		t.Fatalf("cached L1 max=%s, want 200 (listing observed 100)", cached.MaxTXID)
+	}
+	if got.info.MaxTXID != 200 {
+		t.Fatalf("MaxLTXFileInfo=%s, want 200", got.info.MaxTXID)
+	}
+}
+
+// TestDB_MaxLTXFileInfo_DelayedListRespectsReset keeps a listing that started
+// before ResetLocalState from refilling the cache afterward.
+func TestDB_MaxLTXFileInfo_DelayedListRespectsReset(t *testing.T) {
+	inner := newCountingLTXClient()
+	inner.add(agedLTX(1, 1, 100))
+	release := make(chan struct{})
+	client := &gateLTXClient{
+		countingLTXClient: inner,
+		level:             1,
+		started:           make(chan struct{}),
+		release:           release,
+	}
+	db := openRetentionDB(t, client)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.compactor.MaxLTXFileInfo(context.Background(), 1)
+		done <- err
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("level 1 listing did not start")
+	}
+
+	if err := db.ResetLocalState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.cachedMaxLTXFileInfo(1); ok {
+		t.Fatal("listing that started before reset refilled the L1 cache")
+	}
+}
