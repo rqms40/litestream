@@ -380,6 +380,7 @@ func NewDB(path string) *DB {
 		return db.maxLTXFileInfos.gen
 	}
 	db.compactor.PublishCachedMax = db.publishCachedMaxLTX
+	db.compactor.NoteRemovedLTXFiles = db.noteRemovedLTXFiles
 	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -3478,6 +3479,37 @@ func (db *DB) invalidateMaxLTXFileInfo(level int) {
 	delete(db.maxLTXFileInfos.m, level)
 	db.maxLTXFileInfos.gen++
 	db.maxLTXFileInfos.Unlock()
+}
+
+// noteRemovedLTXFiles updates the max-file cache after remote files at level
+// are deleted. The cached file is dropped when it is one of the removed
+// files. The epoch is bumped even when the level cache is empty, under the
+// same lock, so a listing that started earlier cannot publish a removed file.
+func (db *DB) noteRemovedLTXFiles(level int, removed []*ltx.FileInfo) {
+	if len(removed) == 0 {
+		return
+	}
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+
+	info := db.maxLTXFileInfos.m[level]
+	if info != nil {
+		matched := false
+		for _, file := range removed {
+			if file == nil {
+				continue
+			}
+			if file.MinTXID == info.MinTXID && file.MaxTXID == info.MaxTXID {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return
+		}
+		delete(db.maxLTXFileInfos.m, level)
+	}
+	db.maxLTXFileInfos.gen++
 }
 
 // publishCachedMaxLTX stores a max file observed by a listing that started at

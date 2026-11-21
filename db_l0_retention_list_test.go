@@ -491,3 +491,109 @@ func TestDB_MaxLTXFileInfo_DelayedListRespectsReset(t *testing.T) {
 		t.Fatal("listing that started before reset refilled the L1 cache")
 	}
 }
+
+// pauseAfterIter blocks once the underlying iterator is exhausted, after the
+// caller has already observed every file and before it publishes a max.
+type pauseAfterIter struct {
+	ltx.FileIterator
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (itr *pauseAfterIter) Next() bool {
+	if itr.FileIterator.Next() {
+		return true
+	}
+	itr.once.Do(func() { close(itr.started) })
+	<-itr.release
+	return false
+}
+
+// pauseOnceLTXClient wraps only the first listing of one level.
+type pauseOnceLTXClient struct {
+	*countingLTXClient
+	level   int
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+func (c *pauseOnceLTXClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	itr, err := c.countingLTXClient.LTXFiles(ctx, level, seek, useMetadata)
+	if err != nil || level != c.level {
+		return itr, err
+	}
+	wrap := false
+	c.once.Do(func() { wrap = true })
+	if !wrap {
+		return itr, nil
+	}
+	return &pauseAfterIter{FileIterator: itr, started: c.started, release: c.release}, nil
+}
+
+// TestDB_MaxLTXFileInfo_DeletionBumpsEpochWithoutCache is the regression test
+// for retention that deletes an L1 file while a cold-cache listing of that
+// file is in flight. The cache is empty, so invalidation must still bump the
+// epoch. Otherwise the listing caches the deleted file and a later L0 check
+// treats it as coverage.
+func TestDB_MaxLTXFileInfo_DeletionBumpsEpochWithoutCache(t *testing.T) {
+	inner := newCountingLTXClient()
+	inner.add(agedLTX(1, 1, 100))
+	inner.add(agedLTX(1, 50, 60))
+	for tx := ltx.TXID(1); tx <= 70; tx++ {
+		inner.add(agedLTX(0, tx, tx))
+	}
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	client := &pauseOnceLTXClient{
+		countingLTXClient: inner,
+		level:             1,
+		started:           make(chan struct{}),
+		release:           release,
+	}
+	db := openRetentionDB(t, client)
+	db.Replica.SetPos(ltx.Pos{TXID: 100})
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := db.compactor.MaxLTXFileInfo(context.Background(), 1)
+		done <- err
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("level 1 listing did not finish reading files")
+	}
+
+	// Cache is still empty. Deleting [1,100] and keeping [50,60] must
+	// invalidate the epoch anyway.
+	if err := db.EnforceRetentionByTXID(context.Background(), 1, 200); err != nil {
+		t.Fatal(err)
+	}
+	if client.has(1, 1, 100) {
+		t.Fatal("L1 file [1,100] was not deleted")
+	}
+	if !client.has(1, 50, 60) {
+		t.Fatal("L1 file [50,60] was deleted")
+	}
+	unblock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if cached, ok := db.cachedMaxLTXFileInfo(1); ok && cached.MaxTXID > 60 {
+		t.Fatalf("cached L1 max=%s after deletion, want none above 60", cached.MaxTXID)
+	}
+
+	if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for tx := ltx.TXID(61); tx <= 70; tx++ {
+		if !client.has(0, tx, tx) {
+			t.Fatalf("L0 %s deleted using coverage from removed L1 file [1,100]", tx)
+		}
+	}
+}

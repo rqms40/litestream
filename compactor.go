@@ -63,6 +63,12 @@ type Compactor struct {
 	// It returns the file callers should use. When set, listings use this
 	// instead of CacheSetter.
 	PublishCachedMax func(level int, info *ltx.FileInfo, epoch uint64) *ltx.FileInfo
+
+	// NoteRemovedLTXFiles optionally records that remote files at a level were
+	// deleted. It must invalidate cached coverage for that level even when the
+	// cache is empty, so a listing already in flight cannot publish a removed
+	// file. When set, it replaces the CacheGetter/CacheSetter removal path.
+	NoteRemovedLTXFiles func(level int, removed []*ltx.FileInfo)
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -366,9 +372,17 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 // dropCachedLTXFileIfRemoved forgets a cached max file that retention just
 // removed. L0 retention treats that cache as L1 coverage, so a deleted file
 // left in the cache would allow deletion of L0 files that are no longer
-// compacted into L1.
+// compacted into L1. A removal also invalidates the cache epoch when nothing
+// is cached, so a listing that already read the removed file cannot publish it.
 func (c *Compactor) dropCachedLTXFileIfRemoved(level int, removed []*ltx.FileInfo) {
-	if c.CacheGetter == nil || c.CacheSetter == nil || len(removed) == 0 {
+	if len(removed) == 0 {
+		return
+	}
+	if c.NoteRemovedLTXFiles != nil {
+		c.NoteRemovedLTXFiles(level, removed)
+		return
+	}
+	if c.CacheGetter == nil || c.CacheSetter == nil {
 		return
 	}
 	info, ok := c.CacheGetter(level)
